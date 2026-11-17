@@ -714,7 +714,12 @@ export default function LinksTab() {
                       <span className="text-yellow-500 font-medium">{isRTL ? 'متوقف' : 'Paused'}</span>
                     )}
                     {dl.status === 'failed' && (
-                      <span className="text-red-500 font-medium">{isRTL ? 'فشل' : 'Failed'}</span>
+                      <span
+                        className="text-red-500 font-medium truncate max-w-[160px] sm:max-w-xs"
+                        title={dl.errorMessage || (isRTL ? 'فشل' : 'Failed')}
+                      >
+                        {dl.errorMessage || (isRTL ? 'فشل' : 'Failed')}
+                      </span>
                     )}
                     {dl.status === 'queued' && (
                       <span className="text-amber-500 font-medium">{isRTL ? 'في الإنتظار' : 'Queued'}</span>
