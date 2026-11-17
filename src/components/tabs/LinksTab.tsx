@@ -19,9 +19,16 @@ import {
   ListVideo,
   Zap,
 } from 'lucide-react';
-import { socket } from '../../App';
 import { cn } from '../../lib/utils';
 import { PWAInstallButton } from '../PWAInstallButton';
+import {
+  startClientDownload,
+  pauseClientDownload,
+  cancelClientDownload,
+  deleteMediaBlob,
+  resolvePlayableUrl,
+  triggerBrowserSave,
+} from '../../lib/downloadManager';
 
 interface AvailableQualityOption {
   quality: '4k' | '1080p' | '720p' | '480p' | '360p' | '144p' | 'audio-only';
@@ -54,7 +61,6 @@ export default function LinksTab() {
     updateDownload,
     removeDownload,
     downloads,
-    speedLimit,
     concurrentDownloads,
     language,
     consumeUntitledName,
@@ -75,69 +81,16 @@ export default function LinksTab() {
   const [mediaFilter, setMediaFilter] = useState<'all' | 'video' | 'mp3'>('all');
   const [listSortMode, setListSortMode] = useState<string>('date');
 
+  const [progress, setProgress] = useState(0);
+  const [downloadedMB, setDownloadedMB] = useState('0.0');
+  const [speed, setSpeed] = useState('0.00');
+  const [downloadError, setDownloadError] = useState('');
+
   // Playlist state
   const [playlistLoading, setPlaylistLoading] = useState(false);
   const [playlistTitle, setPlaylistTitle] = useState('');
   const [playlistItems, setPlaylistItems] = useState<PlaylistVideoItem[]>([]);
   const [playlistError, setPlaylistError] = useState('');
-
-  useEffect(() => {
-    const onDownloadProgress = (data: any) => {
-      updateDownload(data.id, {
-        downloadedBytes: data.downloaded,
-        totalBytes: data.total,
-        speedBytesPerSec: data.speed,
-        segments: data.segments,
-        status: 'downloading',
-      });
-    };
-
-    const onDownloadStarted = (data: any) => {
-      updateDownload(data.id, {
-        filename: data.filename,
-        name: data.name || data.filename,
-        segments: data.segments,
-        engine: data.engine,
-      });
-    };
-
-    const onDownloadComplete = (data: any) => {
-      updateDownload(data.id, {
-        status: 'completed',
-        filename: data.filename,
-        name: data.name || data.filename,
-        totalBytes: data.totalBytes || undefined,
-      });
-    };
-
-    const onDownloadFailed = (data: any) => {
-      updateDownload(data.id, { status: 'failed' });
-    };
-
-    const onDownloadPaused = (data: any) => {
-      updateDownload(data.id, { status: 'paused' });
-    };
-
-    const onDownloadResumed = (data: any) => {
-      updateDownload(data.id, { status: 'downloading' });
-    };
-
-    socket.on('download_progress', onDownloadProgress);
-    socket.on('download_started', onDownloadStarted);
-    socket.on('download_complete', onDownloadComplete);
-    socket.on('download_failed', onDownloadFailed);
-    socket.on('download_paused', onDownloadPaused);
-    socket.on('download_resumed', onDownloadResumed);
-
-    return () => {
-      socket.off('download_progress', onDownloadProgress);
-      socket.off('download_started', onDownloadStarted);
-      socket.off('download_complete', onDownloadComplete);
-      socket.off('download_failed', onDownloadFailed);
-      socket.off('download_paused', onDownloadPaused);
-      socket.off('download_resumed', onDownloadResumed);
-    };
-  }, [updateDownload]);
 
   const fetchPlaylist = async (targetUrl: string) => {
     setPlaylistLoading(true);
@@ -258,6 +211,19 @@ export default function LinksTab() {
 
   const activeDownloadsCount = downloads.filter((d) => d.status === 'downloading').length;
 
+  const runAxiosDownload = (item: DownloadItem) => {
+    setProgress(0);
+    setDownloadedMB('0.0');
+    setSpeed('0.00');
+    setDownloadError('');
+    void startClientDownload(item, {
+      onProgress: setProgress,
+      onDownloadedMB: setDownloadedMB,
+      onSpeed: setSpeed,
+      onError: setDownloadError,
+    });
+  };
+
   const enqueueAndStart = (targetUrl: string, customTitle?: string) => {
     if (!targetUrl) return;
 
@@ -293,14 +259,7 @@ export default function LinksTab() {
     addDownload(newDownload);
 
     if (shouldStartNow) {
-      socket.emit('start_download', {
-        id,
-        url: targetUrl,
-        format: finalFormat,
-        quality,
-        speedLimit,
-        fallbackName,
-      });
+      runAxiosDownload(newDownload);
     }
   };
 
@@ -317,36 +276,36 @@ export default function LinksTab() {
   };
 
   const handleManualStartItem = (dl: DownloadItem) => {
-    if (dl.status === 'paused') {
-      socket.emit('resume_download', { id: dl.id });
-    } else if (dl.status === 'queued' || dl.status === 'failed') {
-      updateDownload(dl.id, { status: 'downloading', downloadedBytes: 0 });
-      socket.emit('start_download', {
-        id: dl.id,
-        url: dl.url,
-        format: dl.format,
-        quality: dl.quality,
-        speedLimit,
-        fallbackName: dl.name,
-      });
+    if (dl.status === 'paused' || dl.status === 'queued' || dl.status === 'failed') {
+      updateDownload(dl.id, { status: 'downloading', downloadedBytes: 0, errorMessage: undefined });
+      runAxiosDownload(dl);
     }
   };
 
   const handleDeleteItem = (dl: DownloadItem) => {
     if (dl.status === 'downloading' || dl.status === 'paused') {
-      socket.emit('cancel_download', { id: dl.id });
+      cancelClientDownload(dl.id);
     }
+    void deleteMediaBlob(dl.id);
     removeDownload(dl.id);
   };
 
-  const handlePlayClick = (dl: DownloadItem) => {
-    if (dl.status === 'completed' && dl.filename) {
-      const fileUrl = `/downloads/${encodeURIComponent(dl.filename)}`;
+  const handlePlayClick = async (dl: DownloadItem) => {
+    if (dl.status === 'completed') {
+      const fileUrl = await resolvePlayableUrl(dl);
+      if (!fileUrl) return;
       if (dl.type === 'audio' || dl.format === 'mp3' || dl.format === 'm4a') {
-        setPlayingFile({ url: fileUrl, type: 'audio/mpeg', name: dl.name });
+        setPlayingFile({ url: fileUrl, type: 'audio/mpeg', name: dl.filename || dl.name });
       } else {
-        setPlayingFile({ url: fileUrl, type: 'video/mp4', name: dl.name });
+        setPlayingFile({ url: fileUrl, type: 'video/mp4', name: dl.filename || dl.name });
       }
+    }
+  };
+
+  const handleSaveFile = async (dl: DownloadItem) => {
+    const fileUrl = await resolvePlayableUrl(dl);
+    if (fileUrl) {
+      triggerBrowserSave(fileUrl, dl.filename || `${dl.name}.${dl.format}`);
     }
   };
 
@@ -561,6 +520,18 @@ export default function LinksTab() {
             </select>
           </div>
         </div>
+
+        {(downloadError || activeDownloadsCount > 0) && (
+          <div className="mt-2.5 flex items-center justify-between gap-2 text-xs px-1">
+            {downloadError ? (
+              <span className="text-red-500 font-medium truncate">{downloadError}</span>
+            ) : (
+              <span className="text-blue-600 dark:text-blue-400 font-medium">
+                {progress}% • {downloadedMB} MB • {speed} MB/s
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
       {/* YouTube Playlist Panel */}
@@ -773,7 +744,7 @@ export default function LinksTab() {
                 {dl.status === 'downloading' && (
                   <button
                     type="button"
-                    onClick={() => socket.emit('pause_download', { id: dl.id })}
+                    onClick={() => pauseClientDownload(dl.id)}
                     className="p-2 text-yellow-600 bg-yellow-50 hover:bg-yellow-100 dark:bg-yellow-900/20 dark:hover:bg-yellow-900/40 rounded-lg transition"
                     title={isRTL ? 'إيقاف مؤقت' : 'Pause'}
                   >
@@ -793,23 +764,22 @@ export default function LinksTab() {
                 {(dl.status === 'downloading' || dl.status === 'queued' || dl.status === 'paused') && (
                   <button
                     type="button"
-                    onClick={() => socket.emit('cancel_download', { id: dl.id })}
+                    onClick={() => cancelClientDownload(dl.id)}
                     className="hidden sm:inline-flex p-2 text-red-500 bg-red-50 hover:bg-red-100 dark:bg-red-900/20 dark:hover:bg-red-900/40 rounded-lg transition"
                     title={isRTL ? 'إلغاء' : 'Cancel'}
                   >
                     <StopCircle className="w-4 h-4" />
                   </button>
                 )}
-                {dl.status === 'completed' && dl.filename && (
-                  <a
-                    href={`/downloads/${encodeURIComponent(dl.filename)}`}
-                    download={dl.filename}
+                {dl.status === 'completed' && (
+                  <button
+                    type="button"
+                    onClick={() => void handleSaveFile(dl)}
                     className="p-2 text-blue-500 bg-blue-50 hover:bg-blue-100 dark:bg-blue-900/20 dark:hover:bg-blue-900/40 rounded-lg transition"
                     title={isRTL ? 'حفظ الملف' : 'Save File'}
-                    onClick={(e) => e.stopPropagation()}
                   >
                     <Download className="w-4 h-4" />
-                  </a>
+                  </button>
                 )}
                 <button
                   type="button"

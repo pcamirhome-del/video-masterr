@@ -5,21 +5,11 @@ import Sidebar from './components/Sidebar';
 import MainArea from './components/MainArea';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { Menu } from 'lucide-react';
-import { io } from 'socket.io-client';
-
-export const socket = io('/', { autoConnect: false });
 
 export default function App() {
   const { theme, language, dynamicColors } = useAppStore();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [activeTab, setActiveTab] = useState('links');
-
-  useEffect(() => {
-    socket.connect();
-    return () => {
-      socket.disconnect();
-    };
-  }, []);
 
   useEffect(() => {
     const root = window.document.documentElement;

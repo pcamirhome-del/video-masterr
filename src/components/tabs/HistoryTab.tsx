@@ -3,6 +3,7 @@ import { useTranslation } from '../../i18n';
 import { useAppStore, DownloadItem } from '../../store';
 import { FileDown, Calendar, Trash2, X, Music } from 'lucide-react';
 import { cn } from '../../lib/utils';
+import { resolvePlayableUrl } from '../../lib/downloadManager';
 
 export default function HistoryTab() {
   const { t } = useTranslation();
@@ -31,9 +32,10 @@ export default function HistoryTab() {
     document.body.removeChild(link);
   };
 
-  const handlePlayClick = (dl: DownloadItem) => {
-    if (dl.status === 'completed' && dl.filename) {
-      const fileUrl = `/downloads/${encodeURIComponent(dl.filename)}`;
+  const handlePlayClick = async (dl: DownloadItem) => {
+    if (dl.status === 'completed') {
+      const fileUrl = await resolvePlayableUrl(dl);
+      if (!fileUrl) return;
       if (dl.type === 'audio' || dl.format === 'mp3' || dl.format === 'm4a') {
         setPlayingFile({ url: fileUrl, type: 'audio/mpeg', name: dl.filename || dl.name });
       } else {

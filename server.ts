@@ -1,26 +1,14 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { createServer } from 'http';
-import { Server } from 'socket.io';
 import path from 'path';
-import { fileURLToPath } from 'url';
-import fs from 'fs';
 import http from 'http';
 import https from 'https';
-import { spawn } from 'child_process';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
-import ytdl from '@distube/ytdl-core';
 import ytpl from '@distube/ytpl';
 import contentDisposition from 'content-disposition';
-import { Transform } from 'stream';
 import crypto from 'crypto';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const downloadsDir = path.join(process.cwd(), 'downloads');
-if (!fs.existsSync(downloadsDir)) {
-  fs.mkdirSync(downloadsDir, { recursive: true });
-}
 
 const ANDROID_VR_UA =
   'com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip';
@@ -49,32 +37,7 @@ function sanitizeFilename(raw: string): string {
     .slice(0, 140);
 }
 
-function isGenericName(name: string): boolean {
-  const lower = name.toLowerCase().trim();
-  return (
-    !lower ||
-    lower === 'video' ||
-    lower === 'download' ||
-    lower === 'unknown' ||
-    lower === 'file' ||
-    lower === 'media' ||
-    lower === 'index' ||
-    lower.startsWith('videoplayback')
-  );
-}
 
-function getUniqueFilePath(baseName: string, ext: string): { filename: string; filePath: string } {
-  const cleanExt = ext.replace(/^\./, '').toLowerCase() || 'mp4';
-  let candidate = `${baseName}.${cleanExt}`;
-  let filePath = path.join(downloadsDir, candidate);
-  let counter = 2;
-  while (fs.existsSync(filePath)) {
-    candidate = `${baseName} (${counter}).${cleanExt}`;
-    filePath = path.join(downloadsDir, candidate);
-    counter++;
-  }
-  return { filename: candidate, filePath };
-}
 
 function detectPlatform(url: string): string {
   const lower = url.toLowerCase();
@@ -103,20 +66,7 @@ function extractYouTubeId(url: string): string | null {
   return regexMatch ? regexMatch[1] : null;
 }
 
-function runFfmpeg(args: string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn('ffmpeg', ['-y', ...args], { stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
-    proc.stderr?.on('data', (d) => {
-      stderr += d.toString();
-    });
-    proc.on('error', reject);
-    proc.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`ffmpeg exited with code ${code}: ${stderr.slice(-200)}`));
-    });
-  });
-}
+
 
 interface ResolvedMedia {
   mediaUrl: string;
@@ -187,10 +137,9 @@ async function resolveYouTubeInnertube(
       return {
         mediaUrl: bestAudio.url,
         title,
-        ext: format === 'm4a' ? 'm4a' : 'mp3',
+        ext: format === 'm4a' || format === 'mp3' ? 'm4a' : format,
         engine: 'innertube-vr-audio',
         headers,
-        needsAudioConvert: format !== 'm4a',
       };
     }
 
@@ -207,23 +156,24 @@ async function resolveYouTubeInnertube(
         ? 360
         : 144;
 
-    // For 360p or 144p, direct combined MP4 format works without muxing
-    if (targetHeight <= 360) {
-      const directCombined = formats
-        .filter((f) => f.url && String(f.mimeType || '').includes('video/mp4'))
-        .sort((a, b) => (b.height || 0) - (a.height || 0));
-      if (directCombined[0]?.url) {
-        return {
-          mediaUrl: directCombined[0].url,
-          title,
-          ext: format === 'webm' ? 'webm' : 'mp4',
-          engine: 'innertube-vr',
-          headers,
-        };
-      }
+    // Prefer combined video+audio stream for stateless HTTP streaming via /api/proxy
+    const directCombined = formats
+      .filter((f) => f.url && String(f.mimeType || '').startsWith('video/'))
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
+    const chosenCombined =
+      directCombined.find((f) => (f.height || 0) <= targetHeight) || directCombined[0];
+
+    if (chosenCombined?.url) {
+      return {
+        mediaUrl: chosenCombined.url,
+        title,
+        ext: String(chosenCombined.mimeType || '').includes('webm') ? 'webm' : 'mp4',
+        engine: 'innertube-vr',
+        headers,
+      };
     }
 
-    // For HD/FHD/4K: pick best adaptive video stream matching targetHeight + best audio for lossless muxing
+    // Fallback to adaptive stream if combined formats are unavailable
     const wantWebm = format === 'webm';
     const videoPool = adaptive
       .filter(
@@ -246,26 +196,13 @@ async function resolveYouTubeInnertube(
     const chosenVideo =
       fallbackPool.find((f) => (f.height || 0) <= targetHeight) || fallbackPool[0];
 
-    if (chosenVideo?.url && bestAudio?.url) {
+    if (chosenVideo?.url) {
       return {
         mediaUrl: chosenVideo.url,
-        audioUrl: bestAudio.url,
+        audioUrl: bestAudio?.url,
         title,
         ext: wantWebm ? 'webm' : 'mp4',
-        engine: 'innertube-vr-hd',
-        headers,
-        needsMux: true,
-      };
-    }
-
-    // Final fallback to combined format if adaptive unavailable
-    const combined = formats.filter((f) => f.url)[0];
-    if (combined?.url) {
-      return {
-        mediaUrl: combined.url,
-        title,
-        ext: 'mp4',
-        engine: 'innertube-vr',
+        engine: 'innertube-vr-adaptive',
         headers,
       };
     }
@@ -302,30 +239,29 @@ export interface AvailableQualityOption {
   sizeBytes?: number;
 }
 
-// 1. Server-side Hitube.io / Snapvid.net / Viddown.io resolver (never redirects client outside app)
-async function resolveViaHitube(targetUrl: string): Promise<ResolvedMedia | null> {
-  // Attempt 1: Hitube.io API & web parser
-  try {
-    const ts = Date.now().toString();
-    const secureMsg = encryptHitubeTime(ts);
-    const hitubeEndpoints = [
-      {
-        url: 'https://api.hitube.io/v1/video/extract',
-        headers: {
-          Origin: 'https://www.hitube.io',
-          Referer: 'https://www.hitube.io/',
-          's-time': ts,
-          'X-Secure-Message': secureMsg,
-        },
+// 1. Server-side Hitube.io / Snapvid.net / Viddown.io parallel resolvers (never redirects client outside app)
+async function tryHitube(targetUrl: string): Promise<ResolvedMedia | null> {
+  const ts = Date.now().toString();
+  const secureMsg = encryptHitubeTime(ts);
+  const hitubeEndpoints = [
+    {
+      url: 'https://api.hitube.io/v1/video/extract',
+      headers: {
+        Origin: 'https://www.hitube.io',
+        Referer: 'https://www.hitube.io/',
+        's-time': ts,
+        'X-Secure-Message': secureMsg,
       },
-      {
-        url: 'https://www.hitube.io/api/parse',
-        headers: { Origin: 'https://www.hitube.io', Referer: 'https://www.hitube.io/' },
-      },
-    ];
+    },
+    {
+      url: 'https://www.hitube.io/api/parse',
+      headers: { Origin: 'https://www.hitube.io', Referer: 'https://www.hitube.io/' },
+    },
+  ];
 
-    for (const ep of hitubeEndpoints) {
-      try {
+  try {
+    return await Promise.any(
+      hitubeEndpoints.map(async (ep) => {
         const res = await axiosFast.post(
           ep.url,
           { url: targetUrl, link: targetUrl },
@@ -334,83 +270,123 @@ async function resolveViaHitube(targetUrl: string): Promise<ResolvedMedia | null
         const body = res.data?.data || res.data;
         if (typeof body === 'object' && body !== null) {
           const mediaUrl =
-            body.url || body.video || body.hd || body.sd || body.links?.[0]?.url || body.medias?.[0]?.url;
+            body.url ||
+            body.video ||
+            body.hd ||
+            body.sd ||
+            body.links?.[0]?.url ||
+            body.medias?.[0]?.url;
           if (typeof mediaUrl === 'string' && mediaUrl.startsWith('http')) {
             return {
               mediaUrl,
               audioUrl: body.audio || body.music,
               title: body.title,
               engine: 'hitube.io',
-            };
+            } as ResolvedMedia;
           }
         }
-      } catch {
-        // try next
+        throw new Error('hitube empty');
+      })
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function trySnapvid(targetUrl: string): Promise<ResolvedMedia | null> {
+  try {
+    const res = await axiosFast.post(
+      'https://snapvid.net/api/ajaxSearch',
+      new URLSearchParams({ q: targetUrl, vt: 'home' }).toString(),
+      {
+        timeout: 4000,
+        headers: {
+          Origin: 'https://snapvid.net',
+          Referer: 'https://snapvid.net/',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+      }
+    );
+    const body = res.data;
+    if (typeof body === 'object' && body !== null) {
+      if (typeof body.data === 'string') {
+        const $$ = cheerio.load(body.data);
+        const href = $$('a[href^="http"]').first().attr('href');
+        const title = $$('.title, h3, h4, p').first().text().trim();
+        if (href) return { mediaUrl: href, title: title || undefined, engine: 'snapvid.net' };
+      }
+      const mediaUrl =
+        body.url ||
+        body.video ||
+        body.hd ||
+        body.sd ||
+        body.data?.url ||
+        body.links?.[0]?.url ||
+        body.medias?.[0]?.url;
+      if (typeof mediaUrl === 'string' && mediaUrl.startsWith('http')) {
+        return {
+          mediaUrl,
+          audioUrl: body.audio || body.music || body.data?.audio,
+          title: body.title || body.data?.title,
+          engine: 'snapvid.net',
+        };
       }
     }
   } catch {
     // ignore
   }
+  return null;
+}
 
-  // Attempt 2: Snapvid.net & Viddown.io server-side endpoints
-  const mirrorTargets = [
-    {
-      site: 'snapvid.net',
-      postUrl: 'https://snapvid.net/api/ajaxSearch',
-      origin: 'https://snapvid.net',
-      payload: new URLSearchParams({ q: targetUrl, vt: 'home' }).toString(),
-      contentType: 'application/x-www-form-urlencoded',
-    },
-    {
-      site: 'viddown.io',
-      postUrl: 'https://viddown.io/api/extract',
-      origin: 'https://viddown.io',
-      payload: JSON.stringify({ url: targetUrl }),
-      contentType: 'application/json',
-    },
-  ];
-
-  for (const m of mirrorTargets) {
-    try {
-      const res = await axiosFast.post(m.postUrl, m.payload, {
+async function tryViddown(targetUrl: string): Promise<ResolvedMedia | null> {
+  try {
+    const res = await axiosFast.post(
+      'https://viddown.io/api/extract',
+      JSON.stringify({ url: targetUrl }),
+      {
         timeout: 4000,
         headers: {
-          Origin: m.origin,
-          Referer: `${m.origin}/`,
-          'Content-Type': m.contentType,
+          Origin: 'https://viddown.io',
+          Referer: 'https://viddown.io/',
+          'Content-Type': 'application/json',
         },
-      });
-      const body = res.data;
-      if (typeof body === 'object' && body !== null) {
-        if (typeof body.data === 'string') {
-          const $$ = cheerio.load(body.data);
-          const href = $$('a[href^="http"]').first().attr('href');
-          const title = $$('.title, h3, h4, p').first().text().trim();
-          if (href) return { mediaUrl: href, title: title || undefined, engine: m.site };
-        }
-        const mediaUrl =
-          body.url ||
-          body.video ||
-          body.hd ||
-          body.sd ||
-          body.data?.url ||
-          body.links?.[0]?.url ||
-          body.medias?.[0]?.url;
-        if (typeof mediaUrl === 'string' && mediaUrl.startsWith('http')) {
-          return {
-            mediaUrl,
-            audioUrl: body.audio || body.music || body.data?.audio,
-            title: body.title || body.data?.title,
-            engine: m.site,
-          };
-        }
       }
-    } catch {
-      // try next mirror
+    );
+    const body = res.data;
+    if (typeof body === 'object' && body !== null) {
+      const mediaUrl =
+        body.url ||
+        body.video ||
+        body.hd ||
+        body.sd ||
+        body.data?.url ||
+        body.links?.[0]?.url ||
+        body.medias?.[0]?.url;
+      if (typeof mediaUrl === 'string' && mediaUrl.startsWith('http')) {
+        return {
+          mediaUrl,
+          audioUrl: body.audio || body.music || body.data?.audio,
+          title: body.title || body.data?.title,
+          engine: 'viddown.io',
+        };
+      }
     }
+  } catch {
+    // ignore
   }
-
   return null;
+}
+
+async function resolveViaHitube(targetUrl: string): Promise<ResolvedMedia | null> {
+  try {
+    return await Promise.any([
+      tryHitube(targetUrl).then((r) => (r ? r : Promise.reject(new Error('hitube failed')))),
+      trySnapvid(targetUrl).then((r) => (r ? r : Promise.reject(new Error('snapvid failed')))),
+      tryViddown(targetUrl).then((r) => (r ? r : Promise.reject(new Error('viddown failed')))),
+    ]);
+  } catch {
+    return null;
+  }
 }
 
 // 2. TikTok Extractor
@@ -646,164 +622,12 @@ async function probeDirectMedia(
   }
 }
 
-interface ActiveDownloadState {
-  isPaused: boolean;
-  isCancelled: boolean;
-  streams: Array<{ destroy?: () => void; pause?: () => void; resume?: () => void }>;
-  fileStream?: fs.WriteStream | null;
-  tempFiles: string[];
-  filePath?: string;
-}
-
-async function downloadToFileSegmented(
-  id: string,
-  targetUrl: string,
-  destPath: string,
-  headers: Record<string, string>,
-  totalBytes: number,
-  acceptRanges: boolean,
-  speedLimit: string,
-  state: ActiveDownloadState,
-  onProgress: (downloaded: number, total: number, speed: number, segments: number) => void
-): Promise<void> {
-  const canSegment = acceptRanges && totalBytes > 512 * 1024 && speedLimit === 'unlimited';
-  const NUM_SEGMENTS = canSegment ? 8 : 1;
-
-  if (canSegment) {
-    const chunkSize = Math.ceil(totalBytes / NUM_SEGMENTS);
-    const segmentBytes = new Array(NUM_SEGMENTS).fill(0);
-    let lastEmit = Date.now();
-    let lastSum = 0;
-
-    const reportProgress = (force = false) => {
-      if (state.isCancelled) return;
-      const now = Date.now();
-      const dt = (now - lastEmit) / 1000;
-      const totalDownloaded = segmentBytes.reduce((a, b) => a + b, 0);
-      if (force || dt >= 0.25) {
-        const speed = dt > 0 ? Math.max(0, (totalDownloaded - lastSum) / dt) : 0;
-        lastEmit = now;
-        lastSum = totalDownloaded;
-        onProgress(totalDownloaded, totalBytes, speed, NUM_SEGMENTS);
-      }
-    };
-
-    const partPromises = Array.from({ length: NUM_SEGMENTS }, (_, idx) => {
-      const start = idx * chunkSize;
-      const end = Math.min(totalBytes - 1, (idx + 1) * chunkSize - 1);
-      const partPath = `${destPath}.part-${idx}`;
-      state.tempFiles.push(partPath);
-
-      return new Promise<void>(async (resolvePart, rejectPart) => {
-        try {
-          const res = await axiosFast.get(targetUrl, {
-            responseType: 'stream',
-            headers: {
-              ...headers,
-              Range: `bytes=${start}-${end}`,
-            },
-          });
-          const stream = res.data as NodeJS.ReadableStream;
-          const writer = fs.createWriteStream(partPath);
-          state.streams.push(stream as any);
-
-          stream.on('data', (chunk: Buffer) => {
-            if (state.isCancelled) return;
-            segmentBytes[idx] += chunk.length;
-            reportProgress();
-          });
-
-          stream.pipe(writer);
-          writer.on('finish', () => resolvePart());
-          stream.on('error', rejectPart);
-          writer.on('error', rejectPart);
-        } catch (err) {
-          rejectPart(err);
-        }
-      });
-    });
-
-    await Promise.all(partPromises);
-    if (state.isCancelled) return;
-
-    const outStream = fs.createWriteStream(destPath);
-    state.fileStream = outStream;
-    for (let idx = 0; idx < NUM_SEGMENTS; idx++) {
-      const partPath = `${destPath}.part-${idx}`;
-      await new Promise<void>((resolveCopy, rejectCopy) => {
-        const reader = fs.createReadStream(partPath);
-        reader.on('error', rejectCopy);
-        reader.on('end', () => resolveCopy());
-        reader.pipe(outStream, { end: false });
-      });
-      try {
-        fs.unlinkSync(partPath);
-      } catch {
-        // ignore
-      }
-    }
-    await new Promise<void>((resolveEnd) => outStream.end(() => resolveEnd()));
-    reportProgress(true);
-  } else {
-    const response = await axiosFast.get(targetUrl, {
-      responseType: 'stream',
-      headers,
-    });
-    const rawStream = response.data as NodeJS.ReadableStream;
-    const fileStream = fs.createWriteStream(destPath);
-    state.streams.push(rawStream as any);
-    state.fileStream = fileStream;
-
-    let downloaded = 0;
-    let lastEmit = Date.now();
-    let lastDl = 0;
-    const bytesPerSecLimit =
-      speedLimit !== 'unlimited' ? Math.max(16384, parseInt(speedLimit, 10) || 0) : 0;
-
-    const throttle = new Transform({
-      transform(chunk: Buffer, _encoding, callback) {
-        if (state.isCancelled) {
-          callback();
-          return;
-        }
-        downloaded += chunk.length;
-        const now = Date.now();
-        const dt = (now - lastEmit) / 1000;
-        if (dt >= 0.25) {
-          const speed = dt > 0 ? (downloaded - lastDl) / dt : 0;
-          lastEmit = now;
-          lastDl = downloaded;
-          onProgress(downloaded, totalBytes || downloaded, speed, 1);
-        }
-
-        if (bytesPerSecLimit > 0) {
-          const delayMs = Math.min(500, Math.round((chunk.length / bytesPerSecLimit) * 1000));
-          setTimeout(() => callback(null, chunk), delayMs);
-        } else {
-          callback(null, chunk);
-        }
-      },
-    });
-
-    rawStream.pipe(throttle).pipe(fileStream);
-
-    await new Promise<void>((resolveStream, rejectStream) => {
-      fileStream.on('finish', () => resolveStream());
-      rawStream.on('error', rejectStream);
-      fileStream.on('error', rejectStream);
-    });
-  }
-}
-
 async function startServer() {
   const app = express();
   const server = createServer(app);
-  const io = new Server(server, { cors: { origin: '*' } });
 
   const PORT = 3000;
   app.use(express.json());
-
-  app.use('/downloads', express.static(downloadsDir));
 
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok' });
@@ -1088,41 +912,58 @@ async function startServer() {
     }
   });
 
-  // Clean REST extraction endpoint with multi-provider fallback (Hitube -> Snapvid -> Viddown -> Native)
+  // Clean REST extraction endpoint with parallel Promise.any across Hitube / Snapvid / Viddown + native fallback
   app.post('/api/extract', async (req, res) => {
     const { url, quality = '1080p', format = 'mp4' } = req.body || {};
-    if (!url || typeof url !== 'string') {
-      return res.status(400).json({ error: 'URL is required' });
+    if (!url || typeof url !== 'string' || !/^https?:\/\//i.test(url.trim())) {
+      return res.status(400).json({ error: 'رابط غير صالح' });
     }
+    const cleanUrl = url.trim();
     try {
-      const platform = detectPlatform(url);
-      let resolved: ResolvedMedia | null = await resolveViaHitube(url);
-      if (!resolved) {
-        if (platform === 'youtube') resolved = await resolveYouTubeInnertube(url, quality, format);
-        else if (platform === 'tiktok') resolved = await resolveTikTok(url);
-        else if (platform === 'twitter') resolved = await resolveTwitter(url);
-        else if (platform === 'instagram' || platform === 'facebook') resolved = await resolveMetaSocial(url);
-        else resolved = { mediaUrl: url, engine: 'direct' };
+      const platform = detectPlatform(cleanUrl);
+      const nativeResolver = async (): Promise<ResolvedMedia | null> => {
+        if (platform === 'youtube') return resolveYouTubeInnertube(cleanUrl, quality, format);
+        if (platform === 'tiktok') return resolveTikTok(cleanUrl);
+        if (platform === 'twitter') return resolveTwitter(cleanUrl);
+        if (platform === 'instagram' || platform === 'facebook') return resolveMetaSocial(cleanUrl);
+        const probe = await probeDirectMedia(cleanUrl);
+        return probe.ok ? { mediaUrl: cleanUrl, engine: 'direct' } : null;
+      };
+
+      const providers = [
+        tryHitube(cleanUrl).then((r) => (r ? r : Promise.reject(new Error('hitube')))),
+        trySnapvid(cleanUrl).then((r) => (r ? r : Promise.reject(new Error('snapvid')))),
+        tryViddown(cleanUrl).then((r) => (r ? r : Promise.reject(new Error('viddown')))),
+        nativeResolver().then((r) => (r?.mediaUrl ? r : Promise.reject(new Error('native')))),
+      ];
+
+      let resolved: ResolvedMedia | null = null;
+      try {
+        resolved = await Promise.any(providers);
+      } catch {
+        return res.status(502).json({
+          error: 'تم حظر الطلب من المصادر أو الفيديو خاص/غير متاح.',
+        });
       }
-      if (!resolved?.mediaUrl) {
-        return res.status(422).json({ error: 'No direct media stream found across providers' });
-      }
+
+      const filename = `${resolved.title || 'video'}.${resolved.ext || 'mp4'}`;
       return res.json({
         success: true,
         provider: resolved.engine,
         title: resolved.title || 'video',
+        ext: resolved.ext || 'mp4',
         mediaUrl: resolved.mediaUrl,
         audioUrl: resolved.audioUrl || null,
-        proxyPlayUrl: `/api/proxy-download?url=${encodeURIComponent(resolved.mediaUrl)}`,
-        proxyDownloadUrl: `/api/proxy-download?url=${encodeURIComponent(resolved.mediaUrl)}&download=1&filename=${encodeURIComponent((resolved.title || 'video') + '.' + (resolved.ext || 'mp4'))}`,
+        proxyPlayUrl: `/api/proxy?url=${encodeURIComponent(resolved.mediaUrl)}`,
+        proxyDownloadUrl: `/api/proxy?url=${encodeURIComponent(resolved.mediaUrl)}&download=1&filename=${encodeURIComponent(filename)}`,
       });
     } catch (err: any) {
       return res.status(500).json({ error: err?.message || 'Extraction failed' });
     }
   });
 
-  // SSRF-safe CORS-free media proxy for in-app <video> playback and Force Download
-  app.get('/api/proxy-download', async (req, res) => {
+  // SSRF-safe CORS-free media streaming proxy (zero buffering, no size cap)
+  const handleMediaProxy = async (req: express.Request, res: express.Response) => {
     const targetUrl = String(req.query.url || '');
     const forceDownload = req.query.download === '1';
     const rawFilename = sanitizeFilename(String(req.query.filename || 'video.mp4')) || 'video.mp4';
@@ -1187,402 +1028,51 @@ async function startServer() {
     } catch (err: any) {
       return res.status(502).json({ error: err?.message || 'Proxy stream failed' });
     }
-  });
+  };
 
-  const activeDownloads = new Map<string, ActiveDownloadState>();
+  app.get('/api/proxy', handleMediaProxy);
+  app.get('/api/proxy-download', handleMediaProxy);
 
-  io.on('connection', (socket) => {
-    socket.on('start_download', async (data) => {
-      const {
-        id,
-        url,
-        format = 'mp4',
-        quality = '1080p',
-        speedLimit = 'unlimited',
-        fallbackName = 'Video 1',
-      } = data;
 
-      const state: ActiveDownloadState = {
-        isPaused: false,
-        isCancelled: false,
-        streams: [],
-        fileStream: null,
-        tempFiles: [],
-      };
-      activeDownloads.set(id, state);
-
-      const cleanupTemp = () => {
-        for (const tf of state.tempFiles) {
-          try {
-            if (fs.existsSync(tf)) fs.unlinkSync(tf);
-          } catch {
-            // ignore
-          }
-        }
-        if (state.filePath && fs.existsSync(state.filePath)) {
-          try {
-            const stat = fs.statSync(state.filePath);
-            if (stat.size === 0 || state.isCancelled) {
-              fs.unlinkSync(state.filePath);
-            }
-          } catch {
-            // ignore
-          }
-        }
-      };
-
-      try {
-        const platform = detectPlatform(url);
-        const isAudioTarget = format === 'mp3' || format === 'm4a' || quality === 'audio-only';
-        const targetExt = isAudioTarget
-          ? format === 'mp4' || format === 'webm'
-            ? 'mp3'
-            : format
-          : format;
-
-        let resolved: ResolvedMedia | null = null;
-
-        // Step 1: Try Hitube.io for non-direct links
-        if (platform !== 'direct') {
-          const hitubeResult = await resolveViaHitube(url);
-          if (hitubeResult) {
-            const probe = await probeDirectMedia(hitubeResult.mediaUrl, hitubeResult.headers);
-            if (probe.ok) {
-              resolved = hitubeResult;
-            }
-          }
-        }
-
-        // Step 2: Specialized modern extractors
-        if (!resolved) {
-          if (platform === 'youtube') {
-            // Primary: Innertube ANDROID_VR (avoids datacenter bot-check!)
-            resolved = await resolveYouTubeInnertube(url, quality, targetExt);
-
-            // Secondary fallback: ytdl-core
-            if (!resolved && ytdl.validateURL(url)) {
-              const info = await ytdl.getInfo(url);
-              const rawTitle = sanitizeFilename(info.videoDetails.title || '');
-              const baseTitle = isGenericName(rawTitle) ? fallbackName : rawTitle;
-              const { filename, filePath } = getUniqueFilePath(baseTitle, targetExt);
-              state.filePath = filePath;
-
-              const combined = ytdl.filterFormats(info.formats, isAudioTarget ? 'audioonly' : 'videoandaudio');
-              const chosenFormat = combined[0] || ytdl.chooseFormat(info.formats, { quality: 'highest' });
-              const ytdlStream = ytdl.downloadFromInfo(info, {
-                format: chosenFormat,
-                highWaterMark: 1024 * 1024,
-              });
-              const fileStream = fs.createWriteStream(filePath);
-              state.streams.push(ytdlStream);
-              state.fileStream = fileStream;
-
-              socket.emit('download_started', {
-                id,
-                filename,
-                name: baseTitle,
-                segments: 1,
-                engine: 'ytdl-stream',
-              });
-
-              let lastEmit = Date.now();
-              let lastDl = 0;
-
-              ytdlStream.on('progress', (_chunkLen, dl, tot) => {
-                if (state.isCancelled) return;
-                const now = Date.now();
-                const dt = (now - lastEmit) / 1000;
-                if (dt >= 0.25 || dl === tot) {
-                  const speed = dt > 0 ? (dl - lastDl) / dt : 0;
-                  lastEmit = now;
-                  lastDl = dl;
-                  socket.emit('download_progress', {
-                    id,
-                    downloaded: dl,
-                    total: tot || dl,
-                    speed,
-                    segments: 1,
-                  });
-                }
-              });
-
-              ytdlStream.pipe(fileStream);
-              await new Promise<void>((resolveStream, rejectStream) => {
-                fileStream.on('finish', () => resolveStream());
-                ytdlStream.on('error', rejectStream);
-                fileStream.on('error', rejectStream);
-              });
-
-              if (!state.isCancelled) {
-                const stat = fs.statSync(filePath);
-                if (stat.size < 1024) throw new Error('Downloaded file was empty or invalid');
-                socket.emit('download_complete', {
-                  id,
-                  success: true,
-                  filename,
-                  name: baseTitle,
-                  totalBytes: stat.size,
-                });
-              }
-              activeDownloads.delete(id);
-              return;
-            }
-          } else if (platform === 'tiktok') {
-            resolved = await resolveTikTok(url);
-          } else if (platform === 'twitter') {
-            resolved = await resolveTwitter(url);
-          } else if (platform === 'instagram' || platform === 'facebook') {
-            resolved = await resolveMetaSocial(url);
-          } else {
-            resolved = { mediaUrl: url, engine: 'direct' };
-          }
-        }
-
-        if (!resolved) {
-          throw new Error('Could not extract playable video stream from this URL');
-        }
-
-        const chosenUrl =
-          isAudioTarget && resolved.audioUrl && !resolved.needsMux
-            ? resolved.audioUrl
-            : resolved.mediaUrl;
-        const probe = await probeDirectMedia(chosenUrl, resolved.headers);
-        if (!probe.ok) {
-          throw new Error(
-            `Source returned non-media content (${probe.contentType || 'unavailable'})`
-          );
-        }
-
-        let candidateTitle = sanitizeFilename(resolved.title || '');
-        if (isGenericName(candidateTitle) && probe.filename) {
-          candidateTitle = sanitizeFilename(probe.filename.replace(/\.[^/.]+$/, ''));
-        }
-        if (isGenericName(candidateTitle) && platform === 'direct') {
-          try {
-            const urlParts = new URL(chosenUrl).pathname.split('/');
-            const lastPart = decodeURIComponent(urlParts[urlParts.length - 1] || '');
-            if (lastPart) {
-              candidateTitle = sanitizeFilename(lastPart.replace(/\.[^/.]+$/, ''));
-            }
-          } catch {
-            // ignore
-          }
-        }
-        const finalTitle = isGenericName(candidateTitle) ? fallbackName : candidateTitle;
-        const finalExt = resolved.ext || targetExt;
-        const { filename, filePath } = getUniqueFilePath(finalTitle, finalExt);
-        state.filePath = filePath;
-
-        // If adaptive HD/4K YouTube video + separate audio, download both with 8x segmentation and mux with ffmpeg
-        if (resolved.needsMux && resolved.audioUrl) {
-          const audioProbe = await probeDirectMedia(resolved.audioUrl, resolved.headers);
-          const totalCombined = probe.totalBytes + (audioProbe.totalBytes || 0);
-          const videoTmp = path.join(downloadsDir, `.tmp-vid-${id}`);
-          const audioTmp = path.join(downloadsDir, `.tmp-aud-${id}`);
-          state.tempFiles.push(videoTmp, audioTmp);
-
-          socket.emit('download_started', {
-            id,
-            filename,
-            name: finalTitle,
-            segments: probe.acceptRanges ? 8 : 1,
-            engine: resolved.engine,
-          });
-
-          let vidDl = 0;
-          let audDl = 0;
-
-          await Promise.all([
-            downloadToFileSegmented(
-              id,
-              resolved.mediaUrl,
-              videoTmp,
-              resolved.headers || {},
-              probe.totalBytes,
-              probe.acceptRanges,
-              speedLimit,
-              state,
-              (dl, _tot, spd, segs) => {
-                vidDl = dl;
-                socket.emit('download_progress', {
-                  id,
-                  downloaded: vidDl + audDl,
-                  total: totalCombined || vidDl + audDl,
-                  speed: spd,
-                  segments: segs,
-                });
-              }
-            ),
-            downloadToFileSegmented(
-              id,
-              resolved.audioUrl,
-              audioTmp,
-              resolved.headers || {},
-              audioProbe.totalBytes,
-              audioProbe.acceptRanges,
-              speedLimit,
-              state,
-              (dl) => {
-                audDl = dl;
-              }
-            ),
-          ]);
-
-          if (state.isCancelled) {
-            cleanupTemp();
-            return;
-          }
-
-          // Lossless container muxing (-c copy)
-          await runFfmpeg(['-i', videoTmp, '-i', audioTmp, '-c', 'copy', filePath]);
-          try { fs.unlinkSync(videoTmp); } catch {}
-          try { fs.unlinkSync(audioTmp); } catch {}
-        } else if (resolved.needsAudioConvert) {
-          const rawAudioTmp = path.join(downloadsDir, `.tmp-rawaud-${id}.m4a`);
-          state.tempFiles.push(rawAudioTmp);
-
-          socket.emit('download_started', {
-            id,
-            filename,
-            name: finalTitle,
-            segments: probe.acceptRanges ? 8 : 1,
-            engine: resolved.engine,
-          });
-
-          await downloadToFileSegmented(
-            id,
-            chosenUrl,
-            rawAudioTmp,
-            resolved.headers || {},
-            probe.totalBytes,
-            probe.acceptRanges,
-            speedLimit,
-            state,
-            (dl, tot, spd, segs) => {
-              socket.emit('download_progress', {
-                id,
-                downloaded: dl,
-                total: tot,
-                speed: spd,
-                segments: segs,
-              });
-            }
-          );
-
-          if (state.isCancelled) {
-            cleanupTemp();
-            return;
-          }
-
-          await runFfmpeg(['-i', rawAudioTmp, '-vn', '-codec:a', 'libmp3lame', '-q:a', '2', filePath]);
-          try { fs.unlinkSync(rawAudioTmp); } catch {}
-        } else {
-          const canSegment =
-            probe.acceptRanges && probe.totalBytes > 512 * 1024 && speedLimit === 'unlimited';
-
-          socket.emit('download_started', {
-            id,
-            filename,
-            name: finalTitle,
-            segments: canSegment ? 8 : 1,
-            engine: resolved.engine,
-          });
-
-          await downloadToFileSegmented(
-            id,
-            chosenUrl,
-            filePath,
-            resolved.headers || {},
-            probe.totalBytes,
-            probe.acceptRanges,
-            speedLimit,
-            state,
-            (dl, tot, spd, segs) => {
-              socket.emit('download_progress', {
-                id,
-                downloaded: dl,
-                total: tot,
-                speed: spd,
-                segments: segs,
-              });
-            }
-          );
-        }
-
-        if (!state.isCancelled) {
-          const finalStat = fs.statSync(filePath);
-          if (finalStat.size < 1024) {
-            throw new Error('Downloaded file is too small or corrupted');
-          }
-          socket.emit('download_complete', {
-            id,
-            success: true,
-            filename,
-            name: finalTitle,
-            totalBytes: finalStat.size,
-          });
-        }
-        activeDownloads.delete(id);
-      } catch (err: any) {
-        console.error('Download error:', err?.message || err);
-        cleanupTemp();
-        activeDownloads.delete(id);
-        if (!state.isCancelled) {
-          socket.emit('download_failed', { id, error: err?.message || 'Download failed' });
-        }
-      }
-    });
-
-    socket.on('cancel_download', (data) => {
-      const dl = activeDownloads.get(data.id);
-      if (dl) {
-        dl.isCancelled = true;
-        dl.streams.forEach((s) => s.destroy?.());
-        dl.fileStream?.close();
-        for (const tf of dl.tempFiles) {
-          try {
-            if (fs.existsSync(tf)) fs.unlinkSync(tf);
-          } catch {
-            // ignore
-          }
-        }
-        if (dl.filePath && fs.existsSync(dl.filePath)) {
-          try {
-            fs.unlinkSync(dl.filePath);
-          } catch {
-            // ignore
-          }
-        }
-        activeDownloads.delete(data.id);
-        socket.emit('download_failed', { id: data.id, error: 'Cancelled' });
-      }
-    });
-
-    socket.on('pause_download', (data) => {
-      const dl = activeDownloads.get(data.id);
-      if (dl) {
-        dl.isPaused = true;
-        dl.streams.forEach((s) => s.pause?.());
-        socket.emit('download_paused', { id: data.id });
-      }
-    });
-
-    socket.on('resume_download', (data) => {
-      const dl = activeDownloads.get(data.id);
-      if (dl) {
-        dl.isPaused = false;
-        dl.streams.forEach((s) => s.resume?.());
-        socket.emit('download_resumed', { id: data.id });
-      }
-    });
-  });
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
+    const isHmrDisabled = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: isHmrDisabled
+        ? {
+            middlewareMode: true,
+            hmr: false,
+            watch: null,
+          }
+        : {
+            middlewareMode: true,
+            hmr: {
+              server,
+              path: '/vite-hmr',
+            },
+          },
       appType: 'spa',
     });
+
+    if (isHmrDisabled) {
+      app.get('/@vite/client', async (req, res, next) => {
+        try {
+          const transformed = await vite.transformRequest('/@vite/client');
+          if (!transformed) return next();
+          const code = transformed.code.replace(
+            'transport.connect(createHMRHandler(handleMessage));',
+            '/* HMR disabled */'
+          );
+          res.setHeader('Content-Type', 'application/javascript');
+          res.setHeader('Cache-Control', 'no-store');
+          return res.send(code);
+        } catch {
+          return next();
+        }
+      });
+    }
+
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');

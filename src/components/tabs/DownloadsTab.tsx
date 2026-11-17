@@ -17,7 +17,14 @@ import {
 import { cn } from '../../lib/utils';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts';
 import { useRealStorage, formatStorageSize } from '../../hooks/useRealStorage';
-import { socket } from '../../App';
+import {
+  startClientDownload,
+  pauseClientDownload,
+  cancelClientDownload,
+  deleteMediaBlob,
+  resolvePlayableUrl,
+  triggerBrowserSave,
+} from '../../lib/downloadManager';
 
 export default function DownloadsTab() {
   const { t } = useTranslation();
@@ -76,30 +83,27 @@ export default function DownloadsTab() {
     return true;
   });
 
-  const handlePlayClick = (dl: DownloadItem) => {
-    if (dl.status === 'completed' && dl.filename) {
-      const fileUrl = `/downloads/${encodeURIComponent(dl.filename)}`;
+  const handlePlayClick = async (dl: DownloadItem) => {
+    if (dl.status === 'completed') {
+      const fileUrl = await resolvePlayableUrl(dl);
+      if (!fileUrl) return;
       if (dl.type === 'audio' || dl.format === 'mp3' || dl.format === 'm4a') {
-        setPlayingFile({ url: fileUrl, type: 'audio/mpeg', name: dl.name });
+        setPlayingFile({ url: fileUrl, type: 'audio/mpeg', name: dl.filename || dl.name });
       } else {
-        setPlayingFile({ url: fileUrl, type: 'video/mp4', name: dl.name });
+        setPlayingFile({ url: fileUrl, type: 'video/mp4', name: dl.filename || dl.name });
       }
     }
   };
 
   const handleStartOrResume = (dl: DownloadItem) => {
-    if (dl.status === 'paused') {
-      socket.emit('resume_download', { id: dl.id });
-    } else {
-      updateDownload(dl.id, { status: 'downloading', downloadedBytes: 0 });
-      socket.emit('start_download', {
-        id: dl.id,
-        url: dl.url,
-        format: dl.format,
-        quality: dl.quality,
-        speedLimit,
-        fallbackName: dl.name,
-      });
+    updateDownload(dl.id, { status: 'downloading', downloadedBytes: 0, errorMessage: undefined });
+    void startClientDownload(dl);
+  };
+
+  const handleSaveFile = async (dl: DownloadItem) => {
+    const fileUrl = await resolvePlayableUrl(dl);
+    if (fileUrl) {
+      triggerBrowserSave(fileUrl, dl.filename || `${dl.name}.${dl.format}`);
     }
   };
 
@@ -162,7 +166,7 @@ export default function DownloadsTab() {
                 {dl.status === 'downloading' && (
                   <button
                     type="button"
-                    onClick={() => socket.emit('pause_download', { id: dl.id })}
+                    onClick={() => pauseClientDownload(dl.id)}
                     className="p-1.5 text-yellow-600 bg-yellow-50 dark:bg-yellow-900/20 rounded-lg"
                     title={isRTL ? 'إيقاف' : 'Pause'}
                   >
@@ -179,22 +183,23 @@ export default function DownloadsTab() {
                     <Play className="w-4 h-4" />
                   </button>
                 )}
-                {dl.status === 'completed' && dl.filename && (
-                  <a
-                    href={`/downloads/${encodeURIComponent(dl.filename)}`}
-                    download={dl.filename}
+                {dl.status === 'completed' && (
+                  <button
+                    type="button"
+                    onClick={() => void handleSaveFile(dl)}
                     className="p-1.5 text-blue-500 bg-blue-50 dark:bg-blue-900/20 rounded-lg"
                     title={isRTL ? 'تنزيل' : 'Download'}
                   >
                     <Download className="w-4 h-4" />
-                  </a>
+                  </button>
                 )}
                 <button
                   type="button"
                   onClick={() => {
                     if (dl.status === 'downloading' || dl.status === 'paused') {
-                      socket.emit('cancel_download', { id: dl.id });
+                      cancelClientDownload(dl.id);
                     }
+                    void deleteMediaBlob(dl.id);
                     removeDownload(dl.id);
                   }}
                   className="p-1.5 text-red-500 bg-red-50 dark:bg-red-900/20 rounded-lg"

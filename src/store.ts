@@ -15,6 +15,8 @@ export interface DownloadItem {
   dateAdded: number;
   tags: string[];
   filename?: string;
+  playUrl?: string;
+  errorMessage?: string;
   segments?: number;
   engine?: string;
 }
