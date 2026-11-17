@@ -1,0 +1,6 @@
+{
+  "name": "Downloader Master",
+  "description": "Fast multi-platform video & audio downloader PWA with segmented acceleration and YouTube playlist support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
