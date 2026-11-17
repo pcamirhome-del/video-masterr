@@ -124,6 +124,27 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: 'downloader-storage',
+      onRehydrateStorage: () => (state) => {
+        if (!state) return;
+        if (!Array.isArray(state.downloads)) {
+          state.downloads = [];
+        } else {
+          state.downloads = state.downloads
+            .filter((d): d is DownloadItem => Boolean(d && typeof d === 'object' && d.id))
+            .map((d) => ({
+              ...d,
+              name: typeof d.name === 'string' && d.name ? d.name : 'Video',
+              format: d.format || 'mp4',
+              quality: d.quality || '720p',
+              status: d.status || 'failed',
+              downloadedBytes: Number(d.downloadedBytes) || 0,
+              totalBytes: Number(d.totalBytes) || 0,
+              speedBytesPerSec: Number(d.speedBytesPerSec) || 0,
+              dateAdded: Number(d.dateAdded) || Date.now(),
+              tags: Array.isArray(d.tags) ? d.tags : [],
+            }));
+        }
+      },
     }
   )
 );

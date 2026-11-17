@@ -5,6 +5,12 @@
   "framework": "vite",
   "headers": [
     {
+      "source": "/index.html",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }
+      ]
+    },
+    {
       "source": "/sw.js",
       "headers": [
         { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" }
@@ -18,12 +24,14 @@
     }
   ],
   "rewrites": [
-    { "source": "/api/proxy", "destination": "/api/proxy" },
     { "source": "/api/proxy-download", "destination": "/api/proxy" },
-    { "source": "/api/(.*)", "destination": "/api/index" },
-    {
-      "source": "/((?!api/|assets/|manifest\\.webmanifest|sw\\.js|workbox-.*|.*\\..*).*)",
-      "destination": "/index.html"
-    }
+    { "source": "/api/health", "destination": "/api/index" },
+    { "source": "/api/speedtest", "destination": "/api/index" },
+    { "source": "/api/playlist", "destination": "/api/index" },
+    { "source": "/api/resolve", "destination": "/api/index" },
+    { "source": "/api/extract-hitube", "destination": "/api/index" },
+    { "source": "/api/extract", "destination": "/api/index" },
+    { "source": "/api/proxy-meta", "destination": "/api/index" },
+    { "source": "/((?!api/|assets/).*)", "destination": "/index.html" }
   ]
 }
